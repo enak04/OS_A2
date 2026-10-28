@@ -1,0 +1,479 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <errno.h>
+
+#define MAX_SUBJECTS 32
+#define MAX_STUDENTS 128
+
+typedef struct {
+    int student_id;
+    double average;
+    int minimum;
+    int maximum;
+    int subject_marks[MAX_SUBJECTS];
+} student_stats;
+
+typedef struct {
+    int student_id;
+} aggregation_params;
+
+typedef struct {
+    int thread_id;
+    int start_index;
+    int segment_size;
+} thread_params;
+
+static int num_subjects, num_students;
+static int marks[MAX_SUBJECTS][MAX_STUDENTS];
+
+/* Original records stay indexed by student ID. */
+static student_stats students[MAX_STUDENTS];
+
+/* Sorting workers rearrange this separate copy. */
+static student_stats sort_work[MAX_STUDENTS];
+
+/* Final globally sorted result. */
+static student_stats sorted_students[MAX_STUDENTS];
+
+static int active_sort_key;
+
+
+/* Return the value used for sorting. */
+static double sort_value(const student_stats *s, int key)
+{
+    if (key == -3)
+        return s->maximum;
+
+    if (key == -2)
+        return s->minimum;
+
+    if (key == -1)
+        return s->average;
+
+    return s->subject_marks[key];
+}
+
+
+/* Descending order; lower student ID breaks ties. */
+static int comes_before(const student_stats *a,
+                        const student_stats *b,
+                        int key)
+{
+    double va = sort_value(a, key);
+    double vb = sort_value(b, key);
+
+    if (va > vb)
+        return 1;
+
+    if (va < vb)
+        return 0;
+
+    return a->student_id < b->student_id;
+}
+
+
+/* Phase 1: calculate statistics for one student. */
+static void *aggregate_student(void *arg)
+{
+    aggregation_params *p = arg;
+    int id = p->student_id;
+    int i;
+    long total = 0;
+
+    student_stats *s = &students[id];
+
+    s->student_id = id;
+    s->minimum = marks[0][id];
+    s->maximum = marks[0][id];
+
+    for (i = 0; i < num_subjects; ++i) {
+        int m = marks[i][id];
+
+        s->subject_marks[i] = m;
+        total += m;
+
+        if (m < s->minimum)
+            s->minimum = m;
+
+        if (m > s->maximum)
+            s->maximum = m;
+    }
+
+    s->average = (double)total / num_subjects;
+
+    pthread_exit(NULL);
+}
+
+
+/* Sort one contiguous segment of sort_work in place. */
+static void insertion_sort_segment(int start,
+                                   int length,
+                                   int key)
+{
+    int i;
+
+    for (i = start + 1; i < start + length; ++i) {
+        student_stats current = sort_work[i];
+        int j = i - 1;
+
+        while (j >= start &&
+               comes_before(&current, &sort_work[j], key)) {
+            sort_work[j + 1] = sort_work[j];
+            --j;
+        }
+
+        sort_work[j + 1] = current;
+    }
+}
+
+
+/* Phase 2: sorting worker. */
+static void *sort_segment(void *arg)
+{
+    thread_params *p = arg;
+
+    insertion_sort_segment(
+        p->start_index,
+        p->segment_size,
+        active_sort_key
+    );
+
+    pthread_exit(NULL);
+}
+
+
+/* Read and validate the input file. */
+static int read_input(const char *filename)
+{
+    FILE *fp = fopen(filename, "r");
+    int i, j;
+
+    if (!fp) {
+        fprintf(stderr, "Cannot open '%s': %s\n",
+                filename, strerror(errno));
+        return -1;
+    }
+
+    if (fscanf(fp, "%d%d",
+               &num_subjects, &num_students) != 2) {
+        fprintf(stderr,
+                "Input must start with subject count and student count.\n");
+        fclose(fp);
+        return -1;
+    }
+
+    if (num_subjects < 1 || num_subjects > MAX_SUBJECTS ||
+        num_students < 1 || num_students > MAX_STUDENTS) {
+        fprintf(stderr,
+                "Dimensions out of range (subjects 1..%d, students 1..%d).\n",
+                MAX_SUBJECTS, MAX_STUDENTS);
+        fclose(fp);
+        return -1;
+    }
+
+    for (i = 0; i < num_subjects; ++i) {
+        for (j = 0; j < num_students; ++j) {
+            if (fscanf(fp, "%d", &marks[i][j]) != 1) {
+                fprintf(stderr,
+                        "Input file contains too few or invalid marks.\n");
+                fclose(fp);
+                return -1;
+            }
+
+            if (marks[i][j] < 0 || marks[i][j] > 100) {
+                fprintf(stderr,
+                        "Marks must be between 0 and 100.\n");
+                fclose(fp);
+                return -1;
+            }
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
+
+/* Check whether the selected sort key is valid. */
+static int valid_sort_key(int key)
+{
+    return key == -3 ||
+           key == -2 ||
+           key == -1 ||
+           (key >= 0 && key < num_subjects);
+}
+
+
+/* Print the full report card for one student. */
+static void print_student(const student_stats *s)
+{
+    int i;
+
+    printf("Student ID    : %d\n", s->student_id);
+    printf("Average       : %.2f\n", s->average);
+    printf("Minimum       : %d\n", s->minimum);
+    printf("Maximum       : %d\n", s->maximum);
+
+    printf("Subject Marks : [");
+
+    for (i = 0; i < num_subjects; ++i) {
+        printf("%d%s",
+               s->subject_marks[i],
+               i + 1 == num_subjects ? "" : ", ");
+    }
+
+    puts("]");
+}
+
+
+/* Human-readable name of the sort key. */
+static const char *sort_key_name(int key)
+{
+    if (key == -3)
+        return "maximum";
+
+    if (key == -2)
+        return "minimum";
+
+    if (key == -1)
+        return "average";
+
+    return "subject mark";
+}
+
+
+/* Merge the k individually sorted segments. */
+static void merge_segments(int k,
+                           const thread_params params[])
+{
+    int next[MAX_STUDENTS];
+    int end[MAX_STUDENTS];
+    int t, out;
+
+    for (t = 0; t < k; ++t) {
+        next[t] = params[t].start_index;
+        end[t] = params[t].start_index +
+                 params[t].segment_size;
+    }
+
+    for (out = 0; out < num_students; ++out) {
+        int best = -1;
+
+        /* Find the best remaining item among all segments. */
+        for (t = 0; t < k; ++t) {
+            if (next[t] >= end[t])
+                continue;
+
+            if (best == -1 ||
+                comes_before(&sort_work[next[t]],
+                             &sort_work[next[best]],
+                             active_sort_key)) {
+                best = t;
+            }
+        }
+
+        if (best == -1) {
+            fprintf(stderr, "Internal merge error.\n");
+            exit(EXIT_FAILURE);
+        }
+
+        sorted_students[out] = sort_work[next[best]++];
+    }
+}
+
+
+/* Display the current globally sorted order. */
+static void print_sorted_order(void)
+{
+    int i;
+
+    printf("--- Current sorted order (descending by %s) ---\n",
+           sort_key_name(active_sort_key));
+
+    for (i = 0; i < num_students; ++i) {
+        printf("s%-4d %.2f\n",
+               sorted_students[i].student_id,
+               sort_value(&sorted_students[i], active_sort_key));
+    }
+}
+
+
+int main(int argc, char *argv[])
+{
+    pthread_t agg_threads[MAX_STUDENTS];
+    pthread_t sort_threads[MAX_STUDENTS];
+
+    aggregation_params agg_args[MAX_STUDENTS];
+    thread_params sort_args[MAX_STUDENTS];
+
+    char line[256];
+    int i, key, k;
+
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s input.txt\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    if (read_input(argv[1]) != 0)
+        return EXIT_FAILURE;
+
+
+    /* =====================================================
+       PHASE 1: One aggregation thread per student.
+       ===================================================== */
+
+    for (i = 0; i < num_students; ++i) {
+        agg_args[i].student_id = i;
+
+        if (pthread_create(&agg_threads[i],
+                           NULL,
+                           aggregate_student,
+                           &agg_args[i]) != 0) {
+            fprintf(stderr,
+                    "Could not create aggregation thread %d.\n", i);
+            return EXIT_FAILURE;
+        }
+    }
+
+    /* Wait for all aggregation threads to finish. */
+    for (i = 0; i < num_students; ++i) {
+        if (pthread_join(agg_threads[i], NULL) != 0) {
+            fprintf(stderr,
+                    "Could not join aggregation thread %d.\n", i);
+            return EXIT_FAILURE;
+        }
+    }
+
+
+    /* =====================================================
+       PHASE 2: Get sorting options from the user.
+       ===================================================== */
+
+    do {
+        printf("Enter sort key (-3=max, -2=min, -1=avg, 0..%d=subject index): ",
+               num_subjects - 1);
+
+        if (!fgets(line, sizeof(line), stdin))
+            return EXIT_FAILURE;
+
+        if (sscanf(line, "%d", &key) != 1 ||
+            !valid_sort_key(key)) {
+            puts("Invalid sort key. Try again.");
+            key = 999;
+        }
+    } while (!valid_sort_key(key));
+
+
+    do {
+        printf("Enter number of sorting threads (k, 1..%d; factor of %d): ",
+               num_students, num_students);
+
+        if (!fgets(line, sizeof(line), stdin))
+            return EXIT_FAILURE;
+
+        if (sscanf(line, "%d", &k) != 1 ||
+            k < 1 ||
+            k > num_students ||
+            num_students % k != 0) {
+            puts("Invalid k. It must be in range and divide the student count.");
+            k = 0;
+        }
+    } while (k == 0);
+
+
+    /*
+     * IMPORTANT FIX:
+     * Copy original records into sort_work.
+     * Sorting workers modify only sort_work, leaving
+     * students[id] available for correct menu lookups.
+     */
+    for (i = 0; i < num_students; ++i)
+        sort_work[i] = students[i];
+
+    active_sort_key = key;
+
+
+    /* Divide sort_work into k contiguous segments. */
+    {
+        int size = num_students / k;
+
+        for (i = 0; i < k; ++i) {
+            sort_args[i].thread_id = i;
+            sort_args[i].start_index = i * size;
+            sort_args[i].segment_size = size;
+
+            if (pthread_create(&sort_threads[i],
+                               NULL,
+                               sort_segment,
+                               &sort_args[i]) != 0) {
+                fprintf(stderr,
+                        "Could not create sorting thread %d.\n", i);
+                return EXIT_FAILURE;
+            }
+        }
+
+        /* Wait until all segments are sorted. */
+        for (i = 0; i < k; ++i) {
+            if (pthread_join(sort_threads[i], NULL) != 0) {
+                fprintf(stderr,
+                        "Could not join sorting thread %d.\n", i);
+                return EXIT_FAILURE;
+            }
+        }
+    }
+
+
+    /* Merge all sorted segments into one global ordering. */
+    merge_segments(k, sort_args);
+
+
+    /* =====================================================
+       PHASE 3: Interactive menu; no additional threads.
+       ===================================================== */
+
+    for (;;) {
+        int command, id;
+
+        printf("--- Report Card Menu ---\n");
+        printf("Enter command (1 <id> = view student, 2 = view all, 0 = exit): ");
+
+        if (!fgets(line, sizeof(line), stdin))
+            break;
+
+        if (sscanf(line, "%d", &command) != 1) {
+            puts("Invalid command.");
+            continue;
+        }
+
+        if (command == 0)
+            break;
+
+        if (command == 1) {
+            if (sscanf(line, "%*d %d", &id) != 1) {
+                puts("Usage: 1 <student_id>");
+                continue;
+            }
+
+            if (id < 0 || id >= num_students) {
+                printf("Student ID must be between 0 and %d.\n",
+                       num_students - 1);
+                continue;
+            }
+
+            /* Original array is still indexed by student ID. */
+            print_student(&students[id]);
+        }
+        else if (command == 2) {
+            print_sorted_order();
+        }
+        else {
+            puts("Unknown command. Use 0, 1 <student_id>, or 2.");
+        }
+    }
+
+    puts("Exiting report card generator.");
+    return EXIT_SUCCESS;
+}
